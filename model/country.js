@@ -5,8 +5,8 @@ const Country=mongoose.Schema({
         type:String,
         required:true
     },
-    capital:String,
-    region:String,
+    capital:{type:String},
+    region:{type:String},
     population:{
         type:Number,
         required:true
@@ -23,7 +23,7 @@ const Country=mongoose.Schema({
         type:Number,
         required:true
     },
-    flag_url:String,
+    flag_url:{type:String},
     last_refreshed_at:{
         type:String,
         default:Date.now()
