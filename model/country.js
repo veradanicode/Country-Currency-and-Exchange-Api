@@ -3,7 +3,8 @@ const mongoose=require('mongoose');
 const Country=mongoose.Schema({
     name:{
         type:String,
-        required:true
+        required:true,
+        index:true
     },
     capital:{type:String},
     region:{type:String},
@@ -13,7 +14,8 @@ const Country=mongoose.Schema({
     },
     currency_code:{
         type:String,
-        required:true
+        required:true,
+        index:true
     },
     exchange_rate:{
         type:Number,
@@ -25,11 +27,11 @@ const Country=mongoose.Schema({
     },
     flag_url:{type:String},
     last_refreshed_at:{
-        type:String,
+        type:Date,
         default:Date.now()
     }
 
 
-})
+},{timestamps:true})
 
-module.exports=Country;
+module.exports=mongoose.model('Country',Country);
