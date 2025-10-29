@@ -1,15 +1,15 @@
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-
 const Country = require('../model/country');
 const Status = require('../model/status');
 const { createSummaryImage } = require('../utils/image');
 
-const COUNTRIES_API = process.env.EXTERNAL_COUNTRIES_API;
-const EXCHANGE_API = process.env.EXCHANGE_RATES_API;
+const COUNTRIES_API = process.env.EXTERNAL_COUNTRIES_API || 'https://restcountries.com/v2/all?fields=name,capital,region,population,flag,currencies';
+const EXCHANGE_API = process.env.EXCHANGE_RATES_API || 'https://open.er-api.com/v6/latest/USD';
 const CACHE_IMAGE_PATH = process.env.CACHE_IMAGE_PATH || './cache/summary.png';
 
+// Utility helpers
 function randomMultiplier() {
   return Math.floor(Math.random() * 1001) + 1000; // 1000–2000
 }
@@ -18,75 +18,47 @@ function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// =========================================
+// REFRESH: Fetch and store all countries
+// =========================================
 const FetchAllCountries = async (req, res) => {
   try {
     console.log('⚙️ Refresh started...');
-    if (!COUNTRIES_API || !EXCHANGE_API) {
-      return res.status(500).json({ error: 'Server misconfigured: external API URLs missing' });
-    }
 
-    // Fetch both external APIs
-    let countriesResp, exchangeResp;
-    console.log('🌍 Fetching external APIs...');
-    try {
-      [countriesResp, exchangeResp] = await Promise.all([
-        axios.get(COUNTRIES_API, { timeout: 15000 }),
-        axios.get(EXCHANGE_API, { timeout: 15000 })
-      ]);
-      console.log('🌍 something external APIs...');
-    } catch (err) {
-      console.error('External API error:', err.message);
-      return res.status(503).json({
-        error: 'External data source unavailable',
-        details: 'Could not fetch data from Countries API or Exchange Rates API'
-      });
-    }
+    // Fetch from both APIs
+    const [countriesResp, exchangeResp] = await Promise.all([
+      axios.get(COUNTRIES_API, { timeout: 15000 }),
+      axios.get(EXCHANGE_API, { timeout: 15000 })
+    ]);
 
-    if (!countriesResp?.data || !exchangeResp?.data) {
-      return res.status(503).json({ error: 'External data source unavailable' });
-    }
-    console.log('🌍 huii external APIs...');
     const countriesData = countriesResp.data;
     const exchangeData = exchangeResp.data;
     const rates = exchangeData?.rates || {};
 
-    const bulkOps = [];
+    if (!Array.isArray(countriesData) || Object.keys(rates).length === 0) {
+      return res.status(503).json({ error: 'Invalid response from external APIs' });
+    }
+
+    console.log(`🌍 Received ${countriesData.length} countries`);
+
+    // Prepare data for bulk upsert
     const now = new Date();
+    const bulkOps = [];
 
     for (const c of countriesData) {
-      const name = c.name;
-      const population = typeof c.population === 'number' ? c.population : null;
+      if (!c.name || typeof c.population !== 'number' || c.population <= 0) continue;
 
-      if (!name || population === null || population <= 0) continue;
-
-      let currency_code = null;
-      if (Array.isArray(c.currencies) && c.currencies.length > 0) {
-        currency_code = c.currencies[0]?.code || null;
-      }
-
-      let exchange_rate = null;
-      let estimated_gdp = null;
-
-      if (!currency_code) {
-        exchange_rate = null;
-        estimated_gdp = 0;
-      } else {
-        const rate = rates[currency_code];
-        if (!rate) {
-          exchange_rate = null;
-          estimated_gdp = null;
-        } else {
-          exchange_rate = rate;
-          const multiplier = randomMultiplier();
-          estimated_gdp = exchange_rate === 0 ? null : (population * multiplier) / exchange_rate;
-        }
-      }
+      const currency_code = Array.isArray(c.currencies) && c.currencies[0]?.code ? c.currencies[0].code : null;
+      const rate = rates[currency_code];
+      const exchange_rate = rate || null;
+      const multiplier = randomMultiplier();
+      const estimated_gdp = exchange_rate ? (c.population * multiplier) / exchange_rate : null;
 
       const updateDoc = {
-        name,
+        name: c.name,
         capital: c.capital || null,
         region: c.region || null,
-        population,
+        population: c.population,
         currency_code,
         exchange_rate,
         estimated_gdp,
@@ -94,24 +66,27 @@ const FetchAllCountries = async (req, res) => {
         last_refreshed_at: now
       };
 
-      const filter = { name: new RegExp(`^${escapeRegExp(name)}$`, 'i') };
-
       bulkOps.push({
         updateOne: {
-          filter,
+          filter: { name: new RegExp(`^${escapeRegExp(c.name)}$`, 'i') },
           update: { $set: updateDoc },
           upsert: true
         }
       });
     }
 
-    if (bulkOps.length > 0) {
-      await Country.bulkWrite(bulkOps);
+    if (bulkOps.length === 0) {
+      return res.status(500).json({ error: 'No valid countries to store' });
     }
 
+    // Store all countries
+    await Country.bulkWrite(bulkOps);
+    console.log(`✅ Stored/updated ${bulkOps.length} countries`);
+
+    // Update refresh status
     await Status.findOneAndUpdate({}, { last_refreshed_at: now }, { upsert: true });
 
-    // Fetch data for summary
+    // Generate summary image
     const allCountries = await Country.find();
     const totalCountries = allCountries.length;
 
@@ -120,116 +95,102 @@ const FetchAllCountries = async (req, res) => {
       .sort((a, b) => b.estimated_gdp - a.estimated_gdp)
       .slice(0, 5);
 
-    // Ensure cache dir exists
     const cacheDir = path.dirname(CACHE_IMAGE_PATH);
     if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
     await createSummaryImage({
-        total: totalCountries,
-        topCountries: top5.map(x => ({ name: x.name, estimated_gdp: x.estimated_gdp })), // ✅ correct key
-        timestamp: now,
-        outPath: CACHE_IMAGE_PATH
-});
+      total: totalCountries,
+      topCountries: top5.map(x => ({ name: x.name, estimated_gdp: x.estimated_gdp })),
+      timestamp: now,
+      outPath: CACHE_IMAGE_PATH
+    });
 
-
-    return res.json({ message: 'Refresh complete', total_countries: totalCountries, last_refreshed_at: now.toISOString() });
+    return res.status(200).json({
+      message: 'Refresh complete',
+      total_countries: totalCountries,
+      last_refreshed_at: now.toISOString()
+    });
   } catch (err) {
     console.error('❌ Refresh error:', err);
     return res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
 
-// Get all countries (with optional filters)
+// =========================================
+// GET: All countries (with filters/sorting)
+// =========================================
 const GetAllCountries = async (req, res) => {
   try {
     const { region, currency_code, sortBy, order } = req.query;
 
-    // Build filter
     const filter = {};
     if (region) filter.region = new RegExp(`^${region}$`, 'i');
     if (currency_code) filter.currency_code = new RegExp(`^${currency_code}$`, 'i');
 
-    // Sort logic (default: name ascending)
     const sort = {};
-    if (sortBy) {
-      sort[sortBy] = order === 'desc' ? -1 : 1;
-    } else {
-      sort.name = 1;
-    }
+    if (sortBy) sort[sortBy] = order === 'desc' ? -1 : 1;
+    else sort.name = 1;
 
     const countries = await Country.find(filter).sort(sort);
 
-    res.json({
-      total: countries.length,
-      countries
-    });
+    if (!Array.isArray(countries) || countries.length === 0)
+      return res.status(404).json({ error: 'No countries found' });
+
+    res.status(200).json(countries);
   } catch (err) {
     console.error('❌ GetAllCountries error:', err);
     res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
 
-
-// Get single country by name
+// =========================================
+// GET: Single country
+// =========================================
 const GetCountryByName = async (req, res) => {
   try {
     const { name } = req.params;
+    if (!name) return res.status(400).json({ error: 'Country name is required' });
 
-    if (!name) {
-      return res.status(400).json({ error: 'Country name is required' });
-    }
+    const country = await Country.findOne({ name: new RegExp(`^${name}$`, 'i') });
+    if (!country) return res.status(404).json({ error: 'Country not found' });
 
-    // Case-insensitive match
-    const country = await Country.findOne({
-      name: new RegExp(`^${name}$`, 'i')
-    });
-
-    if (!country) {
-      return res.status(404).json({ error: 'Country not found' });
-    }
-
-    res.json(country);
+    res.status(200).json(country);
   } catch (err) {
     console.error('❌ GetCountryByName error:', err);
     res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
 
-// Update a country by name
+// =========================================
+// UPDATE: Single country
+// =========================================
 const UpdateCountry = async (req, res) => {
   try {
     const { name } = req.params;
     const updates = req.body;
 
-    if (!name) {
-      return res.status(400).json({ error: 'Country name is required' });
-    }
-
-    if (!updates || Object.keys(updates).length === 0) {
+    if (!name) return res.status(400).json({ error: 'Country name is required' });
+    if (!updates || Object.keys(updates).length === 0)
       return res.status(400).json({ error: 'No update fields provided' });
-    }
 
-    const updatedCountry = await Country.findOneAndUpdate(
+    const updated = await Country.findOneAndUpdate(
       { name: new RegExp(`^${name}$`, 'i') },
       { $set: updates },
       { new: true }
     );
 
-    if (!updatedCountry) {
-      return res.status(404).json({ error: 'Country not found' });
-    }
+    if (!updated) return res.status(404).json({ error: 'Country not found' });
 
-    res.json({
-      message: '✅ Country updated successfully',
-      country: updatedCountry
-    });
+    res.status(200).json({ message: '✅ Country updated successfully', country: updated });
   } catch (err) {
     console.error('❌ UpdateCountry error:', err);
     res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
 
-// Delete a country by name
+// =========================================
+// DELETE: Single country
+// =========================================
 const DeleteCountry = async (req, res) => {
   try {
     const { name } = req.params;
@@ -238,28 +199,29 @@ const DeleteCountry = async (req, res) => {
     const deleted = await Country.findOneAndDelete({ name: new RegExp(`^${name}$`, 'i') });
     if (!deleted) return res.status(404).json({ error: 'Country not found' });
 
-    return res.json({ message: 'Country deleted' });
+    res.status(200).json({ message: 'Country deleted' });
   } catch (err) {
     console.error('❌ DeleteCountry error:', err);
-    return res.status(500).json({ error: 'Internal server error', details: err.message });
+    res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
 
+// =========================================
+// IMAGE: Serve cached summary image
+// =========================================
 const ServeImage = async (req, res) => {
   try {
-    const imagePath = path.resolve(process.env.CACHE_IMAGE_PATH || './cache/summary.png');
+    const imagePath = path.resolve(CACHE_IMAGE_PATH);
     if (!fs.existsSync(imagePath)) {
       return res.status(404).json({ error: 'Summary image not found' });
     }
+    res.setHeader('Content-Type', 'image/png');
     return res.sendFile(imagePath);
   } catch (err) {
     console.error('❌ ServeImage error:', err);
     return res.status(500).json({ error: 'Internal server error', details: err.message });
   }
 };
-
-
-
 
 module.exports = {
   FetchAllCountries,
